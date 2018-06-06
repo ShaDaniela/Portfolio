@@ -1,0 +1,650 @@
+/**************************************************
+Author: Daniela Shasha
+Date: 5/29/18
+Title: ETL INTO DWUWFinalDB
+Changes: Who, When, What
+***************************************************/
+
+
+
+--****************** [DWUWFinalDB] *********************--
+-- This file contains code used to clear and fill 
+-- the [DWUWFinalDB]database tables.
+--********************************************************************--
+USE DWUWFinalDB
+
+SET NoCount ON;
+GO
+
+--Go
+
+--********************************************************************--
+-- Drop Foreign Keys Constraints
+--********************************************************************--
+
+-- Used with Execute SQL Task "Drop Foreign Key Constraints"
+ ALTER TABLE [dbo].[FactEnrollments] DROP CONSTRAINT [FK_FactEnrollments_DimStudents] 
+ ALTER TABLE [dbo].[FactEnrollments] DROP CONSTRAINT [FK_FactEnrollments_DimClasses] 
+ ALTER TABLE [dbo].[FactEnrollments] DROP CONSTRAINT [FK_FactEnrollments_DimDates_DateKey] 
+ ALTER TABLE [dbo].[FactClassClassrooms] DROP CONSTRAINT [FK_FactClassClassrooms_DimClassrooms_ClassroomKey] 
+ ALTER TABLE [dbo].[FactClassClassrooms] DROP CONSTRAINT [FK_FactClassClassrooms_DimClasses_ClassKey] 
+ ALTER TABLE [dbo].[FactClassClassrooms] DROP CONSTRAINT [FK_FactClassClassrooms_DimDates_ClassroomDateKey] 
+ ALTER TABLE [dbo].[DimClasses] DROP CONSTRAINT [FK_DimClasses_DimDates_ClassStartDateKey] 
+ ALTER TABLE [dbo].[DimClasses] DROP CONSTRAINT [FK_DimClasses_DimDates_ClassEndDateKey] 
+-- You will add Foreign Keys back (At the End of the ETL Process)
+Go
+
+--********************************************************************--
+-- Clear all tables and reset their Identity Auto Number 
+--********************************************************************--
+
+-- Clear all tables data warehouse tables and reset their Identity Auto Number 
+-- Used with Execute SQL Task "Clear All Tables"
+Truncate Table dbo.[FactEnrollments]
+Truncate Table dbo.[FactClassClassrooms]
+Truncate Table dbo.[DimClasses]
+Truncate Table dbo.[DimClassrooms]
+Truncate Table dbo.[DimDates]
+Truncate Table dbo.[DimStudents]
+Go
+
+-- Drop stored procedures
+DROP PROC IF EXISTS spFillFactEnrollments
+DROP PROC IF EXISTS spFillFactClassClassrooms
+DROP PROC IF EXISTS spFillDimClasses
+DROP PROC IF EXISTS spFillDimClassrooms
+DROP PROC IF EXISTS spFillDimDates
+DROP PROC IF EXISTS spFillDimStudents
+Go
+
+--********************************************************************--
+-- Get DimStudents Data
+--********************************************************************--
+
+------ Type 2 SCD table -------
+
+GO
+   If Exists(Select * from Sys.objects where Name = 'vETLDimStudents')
+   Drop View vETLDimStudents;
+
+   If Exists(Select * from Sys.objects where Name = 'pETLSyncDimStudents')
+   DROP PROCEDURE pETLSyncDimStudents;
+
+GO
+CREATE VIEW vETLDimStudents
+AS
+SELECT  [StudentID] = [StudentID]
+       ,[StudentFullName] = ISNULL(CAST([StudentFirstName] +' '+ [StudentLastName] AS VARCHAR(100)),-1)
+ FROM [UWFinalDB].[dbo].[Students]
+GO
+
+/* Testing Code:
+ Select * From vETLDimStudents;
+*/
+
+GO
+Create Procedure pETLSyncDimStudents
+AS
+ BEGIN
+  DECLARE @RC INT = 0;
+  BEGIN TRY
+    -- ETL Processing Code --
+    -- NOTE: Performing the Update before an Insert makes the coding eaiser since there is only one current version of the data
+    -- 1) For UPDATE: Change the EndDate and IsCurrent on any added rows 
+		With ChangedStudents 
+		As(
+		    SELECT [StudentID],[StudentFullName] FROM vETLDimStudents
+			Except
+		    SELECT  [StudentID],[StudentFullName] From DimStudents
+             WHERE IsCurrent = 1 -- Needed if the value is changed back to previous value
+		)UPDATE [DWUWFinalDB].[dbo].[DimStudents]
+		  SET StudentEndDate = GetDate()
+			 ,IsCurrent = 0
+		   WHERE StudentID IN (Select StudentID From ChangedStudents)
+		;
+
+    -- 2)For INSERT or UPDATES: Add new rows to the table
+		WITH AddedORChangedStudents 
+		AS(
+		    SELECT [StudentID],[StudentFullName] FROM vETLDimStudents
+			Except
+		    SELECT  [StudentID],[StudentFullName] From DimStudents
+             WHERE IsCurrent = 1 -- Needed if the value is changed back to previous value
+		)INSERT INTO [DWUWFinalDB].[dbo].[DimStudents]
+        (  [StudentID],[StudentFullName], [StudentStartDate], [StudentEndDate], [IsCurrent])
+         SELECT
+            [StudentID]
+		   ,[StudentFullName]
+           ,[StudentStartDate] = GetDate()
+           ,[StudentEndDate] = Null
+           ,[IsCurrent] = 1
+         FROM vETLDimStudents
+         WHERE StudentID IN (Select StudentID From AddedORChangedStudents)
+       ;
+
+    -- 3) For Delete: Change the IsCurrent status to zero
+		WITH DeletedStudents 
+			AS(
+		    SELECT [StudentID],[StudentFullName] FROM vETLDimStudents
+			Except
+		    SELECT  [StudentID],[StudentFullName] From DimStudents
+   		)UPDATE [DWUWFinalDB].[dbo].[DimStudents]
+		  SET StudentEndDate = GetDate()
+			 ,IsCurrent = 0
+		   WHERE StudentID IN (Select StudentID From DeletedStudents)
+	   ;
+      Set @RC = +1
+  End Try
+  Begin Catch
+   Print Error_Message()
+   Set @RC = -1
+  End Catch
+  Return @RC;
+ End
+go
+
+EXEC pETLSyncDimStudents
+
+/* Testing Code:
+ Declare @Status int;
+ Exec @Status = pETLSyncDimStudents;
+ Print @Status;
+ Select * From DimStudents
+*/
+GO
+
+
+
+--********************************************************************--
+-- Get DimDates Data
+--********************************************************************--
+-- Since the date table has no associated source table we can fill the data
+-- using a SQL script 
+
+GO
+	If Exists(Select * from Sys.objects where Name = 'pETLFillDimDates')
+   Drop Procedure pETLFillDimDates;
+										
+GO
+Create Procedure pETLFillDimDates
+
+AS
+ Begin
+  Declare @RC int = 0;
+  Begin Try
+    -- ETL Processing Code --	  
+      --Delete From DimDates; -- Clears table data with the need for dropping FKs
+	  If ((Select Count(*) From DimDates) = 0)
+	  Begin
+		  Declare @StartDate datetime = '01/01/2012' --< NOTE THE DATE RANGE!
+		  Declare @EndDate datetime = '01/01/2018' --< NOTE THE DATE RANGE! 
+		  Declare @DateInProcess datetime  = @StartDate
+		  -- Loop through the dates until you reach the end date
+		  While @DateInProcess <= @EndDate
+		   Begin
+		   -- Add a row into the date dimension table for this date
+		   Insert Into DimDates 
+		   (  [DateKey], [Date], [Month], [MonthName], [Quarter], [Year] )
+		   Values ( 
+		     Cast(Convert(nVarchar(50), @DateInProcess, 112) as int) -- [DateKey]
+			,@DateInProcess -- [Date]
+			,Cast(Left(Convert(nVarchar(50), @DateInProcess, 112), 6) as int)  -- [Month]
+			,DateName(month, @DateInProcess) + ' - ' + DateName(YYYY,@DateInProcess) -- [MonthName]
+			,CAST( Datepart(q,@DateInProcess) as int)-- [Quarter] 
+			,Year(@DateInProcess ) -- [Year] 
+			)  
+		   -- Add a day and loop again
+		   Set @DateInProcess = DateAdd(d, 1, @DateInProcess)
+		   End -- While
+	   End -- If
+   Set @RC = +1
+  End Try
+  Begin Catch
+   Print Error_Message()
+   Set @RC = -1
+  End Catch
+  Return @RC;
+ End
+go
+
+ EXEC pETLFillDimDates
+
+/* Testing Code:
+ Declare @Status int;
+ Exec @Status = pETLFillDimDates;
+ Print @Status;
+ Select * From DimDates;
+*/
+GO
+
+
+--********************************************************************--
+-- Get DimClassrooms Data
+--********************************************************************--
+
+   If Exists(Select * from Sys.objects where Name = 'vETLDimClassrooms') 
+   Drop View vETLDimClassrooms;										
+
+      If Exists(Select * from Sys.objects where Name = 'pETLSyncDimClassrooms')
+   DROP PROCEDURE pETLSyncDimClassrooms;	
+
+GO
+CREATE VIEW vETLDimClassrooms
+AS
+SELECT 
+		 [ClassroomID] = ISNULL([ClassroomID],-1)
+		,[ClassroomName] = ISNULL (CAST ([ClassroomName] as nvarchar(100)),-1)
+		,[ClassroomMaxClassSize] = ISNULL(CAST([MaxClassSize] as int),-1)
+  FROM [UWFinalDB].[dbo].[Classrooms] 
+GO
+
+/* Testing Code:
+ Select * From vETLDimClassrooms;
+*/
+
+GO
+CREATE PROCEDURE pETLSyncDimClassrooms
+AS
+BEGIN
+  DECLARE @RC INT = 0;
+  BEGIN TRY
+    -- ETL Processing Code --
+    -- 1)For UPDATES: For a Type 1 SCD table we first remove updated rows
+		WITH ChangedClassrooms
+		AS(
+			SELECT [ClassroomID], [ClassroomName],[ClassroomMaxClassSize] From vETLDimClassrooms 
+			EXCEPT
+			SELECT [ClassroomID], [ClassroomName],[ClassroomMaxClassSize]  FROM [DWUWFinalDB].[dbo].[DimClassrooms]
+		)DELETE FROM [DWUWFinalDB].[dbo].[DimClassrooms]
+         WHERE [ClassroomID]  IN (SELECT [ClassroomID]  FROM ChangedClassrooms)
+       ;
+
+    -- 2)For INSERTS AND UPDATES: For a Type 1 SCD table add new rows to the table
+		WITH AddedORChangedClassrooms
+		AS(
+			SELECT [ClassroomID], [ClassroomName],[ClassroomMaxClassSize]  From vETLDimClassrooms 
+			EXCEPT
+			SELECT [ClassroomID], [ClassroomName],[ClassroomMaxClassSize]  FROM [DWUWFinalDB].[dbo].[DimClassrooms]
+		)INSERT INTO [DWUWFinalDB].[dbo].[DimClassrooms]
+        ([ClassroomID], [ClassroomName],[ClassroomMaxClassSize])
+         SELECT [ClassroomID], [ClassroomName],[ClassroomMaxClassSize] From vETLDimClassrooms
+         WHERE [ClassroomName]  IN (SELECT [ClassroomName]  FROM AddedORChangedClassrooms)
+       ;
+
+    -- 3)For Delete: For a Type 1 SCD table flag row as deleted
+	   		WITH DeletedClassrooms 
+		AS(
+			SELECT [ClassroomID], [ClassroomName],[ClassroomMaxClassSize]  From vETLDimClassrooms 
+			EXCEPT
+			SELECT[ClassroomID], [ClassroomName],[ClassroomMaxClassSize] FROM [DWUWFinalDB].[dbo].[DimClassrooms]
+		)UPDATE [DimClassrooms]
+      SET [ClassroomName] = [ClassroomName] + ' (Deleted)'
+         WHERE [ClassroomName]  IN (SELECT [ClassroomName]  FROM DeletedClassrooms)
+       ;
+
+
+
+  SET @RC = +1
+  END TRY
+  BEGIN CATCH
+   PRINT Error_Message()
+   SET @RC = -1
+  END CATCH
+  RETURN @RC;
+ END
+GO
+
+ Exec pETLSyncDimClassrooms
+
+/* Testing Code:
+ Declare @Status int;
+ Exec @Status = pETLSyncDimClassrooms;
+ Print @Status;
+ Select * From DimClassrooms
+*/
+
+
+
+
+
+ 
+--********************************************************************--
+-- Get DimClasses Data
+--********************************************************************--
+
+
+   If Exists(Select * from Sys.objects where Name = 'vETLDimClasses') 
+   Drop View vETLDimClasses;										
+
+      If Exists(Select * from Sys.objects where Name = 'pETLSyncDimClasses')
+   DROP PROCEDURE pETLSyncDimClasses;	
+
+GO
+CREATE VIEW vETLDimClasses
+AS
+SELECT 
+		 [ClassID] = ISNULL([ClassID],-1)
+		,[ClassName] = ISNULL (CAST([ClassName] as nvarchar(100)),-1)
+		,[ClassStartDateKey] = Cast(Convert(nVarchar(50), [ClassStartDate], 112) as int)
+		,[ClassEndDateKey] = Cast(Convert(nVarchar(50), [ClassEndDate], 112) as int)
+		,[ClassCurrentPrice] = ISNULL(CAST([CurrentClassPrice] as money),-1)
+		,[ClassMaxEnrollment] = ISNULL([MaxClassEnrollment],-1)
+		,[DepartmentId] = ISNULL(C.[DepartmentID],-1)
+		,[DepartmentName] = ISNULL(CAST([DepartmentName] as nvarchar(100)),-1)
+  FROM [UWFinalDB].[dbo].[Classes] as C
+  LEFT JOIN [UWFinalDB].[dbo].[Departments] as D
+  ON C.DepartmentID = D.DepartmentID
+GO
+
+/* Testing Code:
+ Select * From vETLDimClasses;
+*/
+
+GO
+CREATE PROCEDURE pETLSyncDimClasses
+AS
+BEGIN
+  DECLARE @RC INT = 0;
+  BEGIN TRY
+    -- ETL Processing Code --
+    -- 1)For UPDATES: For a Type 1 SCD table we first remove updated rows
+		WITH ChangedClasses
+		AS(
+			SELECT [ClassID],[ClassName] ,[ClassStartDateKey],[ClassEndDateKey],[ClassCurrentPrice],[ClassMaxEnrollment], [DepartmentID], [DepartmentName] From vETLDimClasses
+			EXCEPT
+			SELECT [ClassID],[ClassName] ,[ClassStartDateKey],[ClassEndDateKey],[ClassCurrentPrice],[ClassMaxEnrollment], [DepartmentID], [DepartmentName] FROM [DWUWFinalDB].[dbo].[DimClasses]
+		)DELETE FROM [DWUWFinalDB].[dbo].[DimClasses]
+         WHERE [ClassName]  IN (SELECT [ClassName]  FROM ChangedClasses)
+       ;
+
+    -- 2)For INSERTS AND UPDATES: For a Type 1 SCD table add new rows to the table
+		WITH AddedORChangedClasses
+		AS(
+			SELECT [ClassID],[ClassName] ,[ClassStartDateKey],[ClassEndDateKey],[ClassCurrentPrice],[ClassMaxEnrollment],[DepartmentID], [DepartmentName] From vETLDimClasses
+			EXCEPT
+			SELECT [ClassID],[ClassName] ,[ClassStartDateKey],[ClassEndDateKey],[ClassCurrentPrice],[ClassMaxEnrollment],[DepartmentID], [DepartmentName] FROM [DWUWFinalDB].[dbo].[DimClasses]
+		)INSERT INTO [DWUWFinalDB].[dbo].[DimClasses]
+        ([ClassID],[ClassName] ,[ClassStartDateKey],[ClassEndDateKey],[ClassCurrentPrice],[ClassMaxEnrollment], [DepartmentID], [DepartmentName] )
+         SELECT [ClassID],[ClassName] ,[ClassStartDateKey],[ClassEndDateKey],[ClassCurrentPrice],[ClassMaxEnrollment], [DepartmentID], [DepartmentName] From vETLDimClasses
+         WHERE [ClassName]  IN (SELECT [ClassName]  FROM AddedORChangedClasses)
+       ;
+
+    -- 3)For Delete: For a Type 1 SCD table flag row as deleted
+	   		WITH DeletedClasses 
+		AS(
+			SELECT [ClassID],[ClassName] ,[ClassStartDateKey],[ClassEndDateKey],[ClassCurrentPrice],[ClassMaxEnrollment], [DepartmentID], [DepartmentName]From vETLDimClasses
+			EXCEPT
+			SELECT [ClassID],[ClassName] ,[ClassStartDateKey],[ClassEndDateKey],[ClassCurrentPrice],[ClassMaxEnrollment],[DepartmentID], [DepartmentName] FROM [DWUWFinalDB].[dbo].[DimClasses]
+		)UPDATE [DimClasses]
+      SET [ClassName] = [ClassName] + ' (Deleted)'
+         WHERE [ClassName]  IN (SELECT [ClassName]  FROM DeletedClasses)
+       ;
+
+
+
+  SET @RC = +1
+  END TRY
+  BEGIN CATCH
+   PRINT Error_Message()
+   SET @RC = -1
+  END CATCH
+  RETURN @RC;
+ END
+GO
+
+ Exec pETLSyncDimClasses
+
+/* Testing Code:
+ Declare @Status int;
+ Exec @Status = pETLSyncDimClasses;
+ Print @Status;
+ Select * From DimClasses
+*/
+
+
+
+
+
+--********************************************************************--
+-- Get FactEnrollments Data
+--********************************************************************--
+
+
+/****** FILLING FactEnrollments TABLE ******/
+/****** [dbo].[FactEnrollments] ******/
+
+   If Exists(Select * from Sys.objects where Name = 'vETLFactEnrollments') 
+   Drop View vETLFactEnrollments;										
+
+      If Exists(Select * from Sys.objects where Name = 'pETLSyncFactEnrollments')
+   DROP PROCEDURE pETLSyncFactEnrollments;	
+
+GO
+CREATE VIEW vETLFactEnrollments
+AS
+SELECT 
+		  [StudentKey] = ISNULL([StudentKey],-1)
+		, [ClassKey] = ISNULL(DC.[ClassKey], -1)
+		, [EnrollmentID] = ISNULL(E.[EnrollmentID], -1)
+		, [EnrollmentDateKey] = Cast(Convert(nVarchar(50), [EnrollmentDate], 112) as int)
+		, [ActualEnrollmentPrice] = CAST(E.[ActualEnrollmentPrice] as money)
+		FROM [UWFinalDB].[dbo].[Enrollments] as E
+		INNER JOIN UWFinalDB.dbo.Students AS S
+		ON S.StudentID = E.StudentID
+		INNER JOIN DWUWFinalDB.dbo.DimStudents DS
+		ON S.StudentID = DS.StudentID
+		INNER JOIN UWFinalDB.dbo.Classes AS C 
+		ON C.ClassID = E.ClassID
+		INNER JOIN DWUWFinalDB.dbo.DimClasses AS DC
+		ON DC.ClassID = C.ClassID
+
+ GO
+
+/* Testing Code:
+ Select * From vETLFactEnrollments;
+*/
+
+
+GO
+CREATE PROCEDURE pETLSyncFactEnrollments
+AS
+BEGIN
+  DECLARE @RC INT = 0;
+  BEGIN TRY
+    -- ETL Processing Code --
+    -- 1)For Updates: Remove updated rows
+		WITH ChangedFactEnrollments
+		AS(
+			SELECT [StudentKey], [ClassKey],[EnrollmentID] , [EnrollmentDateKey] , [ActualEnrollmentPrice]   FROM vETLFactEnrollments
+			EXCEPT
+			SELECT [StudentKey], [ClassKey],[EnrollmentID] , [EnrollmentDateKey] , [ActualEnrollmentPrice]  FROM [DWUWFinalDB].[dbo].[FactEnrollments]
+		)DELETE [DWUWFinalDB].[dbo].[FactEnrollments]
+         WHERE [EnrollmentID]  IN (SELECT [EnrollmentID]  FROM ChangedFactEnrollments)
+       ;
+
+	    -- 2)For INSERT or UPDATES: Add new rows to the table
+	WITH AddedORChangedFactEnrollments
+	AS(
+		SELECT [StudentKey], [ClassKey],[EnrollmentID] , [EnrollmentDateKey] , [ActualEnrollmentPrice]  FROM vETLFactEnrollments
+		EXCEPT
+		SELECT [StudentKey], [ClassKey],[EnrollmentID] , [EnrollmentDateKey] , [ActualEnrollmentPrice]  FROM [DWUWFinalDB].[dbo].[FactEnrollments]
+	)INSERT INTO [DWUWFinalDB].[dbo].[FactEnrollments]
+    ([StudentKey], [ClassKey],[EnrollmentID] , [EnrollmentDateKey] , [ActualEnrollmentPrice]  )
+        SELECT [StudentKey], [ClassKey],[EnrollmentID] , [EnrollmentDateKey] , [ActualEnrollmentPrice] From vETLFactEnrollments
+        WHERE [EnrollmentID]  IN (SELECT [EnrollmentID]  FROM AddedORChangedFactEnrollments)
+    ;
+
+   -- 3) ForDeletes: Delete row
+	WITH DeltedFDS
+	AS(
+		SELECT [StudentKey], [ClassKey],[EnrollmentID] , [EnrollmentDateKey] , [ActualEnrollmentPrice]  FROM vETLFactEnrollments
+		EXCEPT
+		SELECT [StudentKey], [ClassKey],[EnrollmentID] , [EnrollmentDateKey] , [ActualEnrollmentPrice]  FROM [DWUWFinalDB].[dbo].[FactEnrollments]
+	)DELETE [DWUWFinalDB].[dbo].[FactEnrollments]
+         WHERE [EnrollmentID]  IN (SELECT [EnrollmentID]  FROM DeltedFDS)
+    ;
+
+
+
+      SET @RC = +1
+  END TRY
+  BEGIN CATCH
+   PRINT Error_Message()
+   SET @RC = -1
+  END CATCH
+  RETURN @RC;
+ END
+GO
+
+EXEC  pETLSyncFactEnrollments
+/* Testing Code:
+ Declare @Status int;
+ Exec @Status = pETLSyncFactEnrollments;
+ Print @Status;
+ Select * From FactEnrollments
+*/
+
+
+
+
+
+
+
+
+--********************************************************************--
+-- Get FactClassClassrooms Data
+--********************************************************************--
+
+
+/****** FILLING FactClassClassrooms TABLE ******/
+/****** [dbo].[FactClassClassrooms] ******/
+
+   If Exists(Select * from Sys.objects where Name = 'vETLFactClassClassrooms') 
+   Drop View vETLFactClassClassrooms;										
+
+      If Exists(Select * from Sys.objects where Name = 'pETLSyncFactClassClassrooms')
+   DROP PROCEDURE pETLSyncFactClassClassrooms;	
+
+GO
+CREATE VIEW vETLFactClassClassrooms
+AS
+SELECT 
+		  [ClassKey] = ISNULL([ClassKey],-1)
+        , [ClassroomKey] = ISNULL([ClassroomKey],-1)
+		, [ClassroomDateKey] = Cast(Convert(nVarchar(50), [ClassroomDate], 112) as int)
+		, [ClassID] = ISNULL(CC.[ClassID],-1)
+		, [ClassroomID] = ISNULL(CC.[ClassroomID],-1)
+		FROM [UWFinalDB].[dbo].[ClassClassrooms] as CC
+		INNER JOIN [DWUWFinalDB].[dbo].[DimClasses] as DC
+		ON DC.ClassID = CC.ClassID
+		INNER JOIN [DWUWFinalDB].[dbo].[DimClassrooms] as DCR
+		ON CC.ClassroomID= DCR.ClassroomID
+
+ GO
+
+/* Testing Code:
+ Select * From vETLFactClassClassrooms;
+*/
+
+
+GO
+CREATE PROCEDURE pETLSyncFactClassClassrooms
+AS
+BEGIN
+  DECLARE @RC INT = 0;
+  BEGIN TRY
+    -- ETL Processing Code --
+    -- 1)For Updates: Remove updated rows
+		WITH ChangedFactClassClassrooms
+		AS(
+			SELECT [ClassKey] , [ClassroomKey] , [ClassroomDateKey], [ClassID],[ClassroomID]   FROM vETLFactClassClassrooms
+			EXCEPT
+			SELECT [ClassKey] , [ClassroomKey] , [ClassroomDateKey], [ClassID],[ClassroomID]   FROM [DWUWFinalDB].[dbo].[FactClassClassrooms]
+		)DELETE [DWUWFinalDB].[dbo].[FactClassClassrooms]
+         WHERE [CLassKey]  IN (SELECT [ClassKey]  FROM ChangedFactClassClassrooms)
+       ;
+
+	    -- 2)For INSERT or UPDATES: Add new rows to the table
+	WITH AddedORChangedFactClassClassrooms
+	AS(
+		SELECT  [ClassKey] , [ClassroomKey] , [ClassroomDateKey], [ClassID],[ClassroomID]    FROM vETLFactClassClassrooms
+		EXCEPT
+		SELECT  [ClassKey] , [ClassroomKey] , [ClassroomDateKey], [ClassID],[ClassroomID]   FROM [DWUWFinalDB].[dbo].[FactClassClassrooms]
+	)INSERT INTO [DWUWFinalDB].[dbo].[FactClassClassrooms]
+    ( [ClassKey] , [ClassroomKey] , [ClassroomDateKey], [ClassID],[ClassroomID]   )
+        SELECT  [ClassKey] , [ClassroomKey] , [ClassroomDateKey], [ClassID],[ClassroomID]   From vETLFactClassClassrooms
+        WHERE [ClassKey]  IN (SELECT [ClassKey]  FROM AddedORChangedFactClassClassrooms)
+    ;
+
+   -- 3) ForDeletes: Delete row
+	WITH DeletedFactClassClassrooms
+	AS(
+		SELECT  [ClassKey] , [ClassroomKey] , [ClassroomDateKey], [ClassID],[ClassroomID]   FROM vETLFactClassClassrooms
+		EXCEPT
+		SELECT  [ClassKey] , [ClassroomKey] , [ClassroomDateKey], [ClassID],[ClassroomID]   FROM [DWUWFinalDB].[dbo].[FactClassClassrooms]
+	)DELETE [DWUWFinalDB].[dbo].[FactClassClassrooms]
+         WHERE [ClassKey]  IN (SELECT [ClassKey]  FROM DeletedFactClassClassrooms)
+    ;
+
+
+
+      SET @RC = +1
+  END TRY
+  BEGIN CATCH
+   PRINT Error_Message()
+   SET @RC = -1
+  END CATCH
+  RETURN @RC;
+ END
+GO
+
+EXEC  pETLSyncFactClassClassrooms
+/* Testing Code:
+ Declare @Status int;
+ Exec @Status = pETLSyncFactClassClassrooms;
+ Print @Status;
+ Select * From FactClassClassrooms
+*/
+
+
+
+--********************************************************************--
+-- Replace Foreign Keys Constraints
+--********************************************************************--
+
+
+ ALTER TABLE [dbo].[FactEnrollments] ADD CONSTRAINT [FK_FactEnrollments_DimStudents] 
+ FOREIGN KEY   ([StudentKey]) REFERENCES [dbo].[DimStudents] ([StudentKey]) 
+
+ ALTER TABLE [dbo].[FactEnrollments] ADD CONSTRAINT [FK_FactEnrollments_DimClasses] 
+ FOREIGN KEY	(ClassKey) REFERENCES [dbo].[DimClasses] (ClassKey) 
+
+ ALTER TABLE [dbo].[FactClassClassrooms] ADD CONSTRAINT [FK_FactClassClassrooms_DimClassrooms_ClassroomKey] 
+ FOREIGN KEY	([ClassroomKey]) REFERENCES [dbo].[DimClassrooms] ([ClassroomKey]) 
+
+ ALTER TABLE [dbo].[FactClassClassrooms] ADD CONSTRAINT [FK_FactClassClassrooms_DimClasses_ClassKey] 
+ FOREIGN KEY	([ClassKey]) REFERENCES [dbo].[DimClasses] ([ClassKey]) 
+
+ ALTER TABLE [dbo].[FactClassClassrooms] ADD CONSTRAINT [FK_FactClassClassrooms_DimDates_ClassroomDateKey] 
+ FOREIGN KEY	([ClassroomDateKey]) REFERENCES [dbo].[DimDates] ([DateKey])               
+
+ ALTER TABLE [dbo].[DimClasses] ADD CONSTRAINT [FK_DimClasses_DimDates_ClassStartDateKey]
+ FOREIGN KEY	([ClassStartDateKey]) REFERENCES [dbo].[DimDates] ([DateKey])               
+
+ ALTER TABLE [dbo].[DimClasses] ADD CONSTRAINT [FK_DimClasses_DimDates_ClassEndDateKey]  
+ FOREIGN KEY	([ClassEndDateKey]) REFERENCES [dbo].[DimDates] ([DateKey])                
+
+ ALTER TABLE [dbo].[FactEnrollments] ADD CONSTRAINT [FK_FactEnrollments_DimDates_DateKey]  
+ FOREIGN KEY	([EnrollmentDateKey]) REFERENCES [dbo].[DimDates] ([DateKey])  
+
+
+--********************************************************************--
+-- Review the results of this script
+--********************************************************************--
+
+SELECT * FROM DimClasses
+SELECT * FROM DimClassrooms
+SELECT * FROM DimDates
+SELECT * FROM DimStudents
+SELECT * FROM FactEnrollments
+SELECT * FROM FactClassClassrooms
